@@ -1185,8 +1185,11 @@ static std::vector<FuncDef> extract_functions(const std::string& csrc,
 
     // Look up the python function name from the mdef entry, by matching
     // __pyx_pw_<middle>_N_ against __pyx_pf_<middle>__
+    // Cython 0.x: static PyMethodDef __pyx_mdef_X = {...};
+    // Cython 3.x: static PyMethodDef __pyx_mdef_X = {...}; (same)
+    //              OR static PyMethodDef __pyx_Umdef_X = {...}; (with 'U' prefix for some)
     static const std::regex re_mdef(
-        R"PYREGEX(static\s+PyMethodDef\s+(__pyx_mdef_[A-Za-z0-9_]+)\s*=\s*\{\s*"([^"]+)"\s*,\s*\(?\s*PyCFunction\s*\)?\s*(__pyx_pw_[A-Za-z0-9_]+)\s*,\s*(\w+)\s*,\s*0\s*\}\s*;)PYREGEX");
+        R"PYREGEX(static\s+PyMethodDef\s+(__pyx_[Um]*mdef_[A-Za-z0-9_]+)\s*=\s*\{\s*"([^"]+)"\s*,\s*\(?\s*PyCFunction\s*\)?\s*(__pyx_pw_[A-Za-z0-9_]+)\s*,\s*(\w+)\s*,\s*0\s*\}\s*;)PYREGEX");
     std::string pf_prefix = f.c_pf_name;
     auto mbegin = std::sregex_iterator(csrc.begin(), csrc.end(), re_mdef);
     auto mend = std::sregex_iterator();
@@ -1280,6 +1283,14 @@ static std::string resolve_ref(const std::string& tok, DecodeCtx& ctx) {
   std::smatch mc;
   while (std::regex_search(t, mc, re_cast)) t = mc[1].str();
 
+  // Strip __pyx_mstate_global->__pyx_X -> __pyx_X (Cython 3.x module state pattern)
+  // Also handle __pyx_mstate->__pyx_X
+  if (starts_with(t, "__pyx_mstate_global->__pyx_")) {
+    t = "__pyx_" + t.substr(27);  // len("__pyx_mstate_global->__pyx_") = 27
+  } else if (starts_with(t, "__pyx_mstate->__pyx_")) {
+    t = "__pyx_" + t.substr(20);  // len("__pyx_mstate->__pyx_") = 20
+  }
+
   if (starts_with(t, "__pyx_t_")) {
     auto it = ctx.ssa.find(t);
     if (it != ctx.ssa.end()) return it->second;
@@ -1290,9 +1301,10 @@ static std::string resolve_ref(const std::string& tok, DecodeCtx& ctx) {
     if (it != ctx.varmap.end()) return it->second;
     return t.substr(8);
   }
-  if (t == "__pyx_d") return "globals()";
-  if (t == "__pyx_m") return "<module>";
-  if (t == "__pyx_b") return "builtins";
+  if (t == "__pyx_d" || t == "__pyx_mstate_global->__pyx_d" || t == "__pyx_mstate->__pyx_d")
+    return "globals()";
+  if (t == "__pyx_m" || t == "__pyx_mstate_global->__pyx_m") return "<module>";
+  if (t == "__pyx_b" || t == "__pyx_mstate_global->__pyx_b") return "builtins";
   if (starts_with(t, "__pyx_builtin_")) {
     std::string name = t.substr(14);  // length of "__pyx_builtin_"
     return name;
@@ -1343,6 +1355,90 @@ static std::string decode_rhs(const std::string& rhs, DecodeCtx& ctx) {
   r = std::regex_replace(r, re_cast, "");
 
   std::smatch m;
+
+  // Cython 3.x: __Pyx_PyObject_FastCall(FN, args, nargs) — vectorcall
+  // Pattern: __Pyx_PyObject_FastCall((PyObject*)__pyx_t_22, __pyx_callargs+__pyx_t_5, (2-__pyx_t_5) | (...))
+  // We approximate: FN(*callargs) — but we don't know callargs contents, so emit FN(*args)
+  static const std::regex re_fastcall(
+      R"(__Pyx_PyObject_FastCall\s*\(\s*\(?\s*PyObject\s*\*\s*\)?\s*([^,]+?)\s*,\s*[^,]+,\s*[^)]+\))");
+  if (std::regex_search(r, m, re_fastcall)) {
+    return resolve_ref(m[1].str(), ctx) + "(*callargs)";
+  }
+  // Cython 3.x: PyObject_RichCompare(A, B, Py_EQ/Py_NE/Py_LT/Py_LE/Py_GT/Py_GE)
+  static const std::regex re_richcmp(
+      R"PYREGEX(PyObject_RichCompare\s*\(\s*([^,]+)\s*,\s*([^,]+)\s*,\s*Py_(EQ|NE|LT|LE|GT|GE)\))PYREGEX");
+  if (std::regex_search(r, m, re_richcmp)) {
+    std::string op = "==";
+    if (m[3].str() == "NE") op = "!=";
+    else if (m[3].str() == "LT") op = "<";
+    else if (m[3].str() == "LE") op = "<=";
+    else if (m[3].str() == "GT") op = ">";
+    else if (m[3].str() == "GE") op = ">=";
+    return resolve_ref(m[1].str(), ctx) + " " + op + " " + resolve_ref(m[2].str(), ctx);
+  }
+  // Cython 3.x: __Pyx_PyNumber_Add/Subtract/Multiply/etc (binary ops)
+  static const std::regex re_binop(
+      R"PYREGEX(__Pyx_PyNumber_(Add|Subtract|Multiply|Divide|Remainder|And|Or|Xor|Lshift|Rshift)\s*\(\s*([^,]+)\s*,\s*([^)]+?)\))PYREGEX");
+  if (std::regex_search(r, m, re_binop)) {
+    std::string op = "+";
+    if (m[1].str() == "Subtract") op = "-";
+    else if (m[1].str() == "Multiply") op = "*";
+    else if (m[1].str() == "Divide") op = "/";
+    else if (m[1].str() == "Remainder") op = "%";
+    else if (m[1].str() == "And") op = "&";
+    else if (m[1].str() == "Or") op = "|";
+    else if (m[1].str() == "Xor") op = "^";
+    else if (m[1].str() == "Lshift") op = "<<";
+    else if (m[1].str() == "Rshift") op = ">>";
+    return resolve_ref(m[2].str(), ctx) + " " + op + " " + resolve_ref(m[3].str(), ctx);
+  }
+  // Cython 3.x: PyUnicode_Join(sep, iterable) -> sep.join(iterable)
+  static const std::regex re_unicodejoin(
+      R"(PyUnicode_Join\s*\(\s*([^,]+)\s*,\s*([^)]+?)\))");
+  if (std::regex_search(r, m, re_unicodejoin)) {
+    return resolve_ref(m[1].str(), ctx) + ".join(" + resolve_ref(m[2].str(), ctx) + ")";
+  }
+  // Cython 3.x: PyUnicode_Split(s, sep, maxsplit) -> s.split(sep, maxsplit)
+  static const std::regex re_unicodesplit(
+      R"PYREGEX(PyUnicode_Split\s*\(\s*([^,]+)\s*,\s*([^,]+)\s*,\s*([^)]+?)\))PYREGEX");
+  if (std::regex_search(r, m, re_unicodesplit)) {
+    std::string sep = resolve_ref(m[2].str(), ctx);
+    std::string maxsp = resolve_ref(m[3].str(), ctx);
+    if (sep == "-1" || sep == "Py_None" || sep == "None") {
+      return resolve_ref(m[1].str(), ctx) + ".split()";
+    }
+    if (maxsp == "-1") {
+      return resolve_ref(m[1].str(), ctx) + ".split(" + sep + ")";
+    }
+    return resolve_ref(m[1].str(), ctx) + ".split(" + sep + ", " + maxsp + ")";
+  }
+  // Cython 3.x: __Pyx_GetItemInt_List(seq, idx, ...) -> seq[idx]
+  static const std::regex re_getitemint(
+      R"(__Pyx_GetItemInt_(?:List|Tuple|Sequence)\s*\(\s*([^,]+)\s*,\s*([^,]+))");
+  if (std::regex_search(r, m, re_getitemint)) {
+    return resolve_ref(m[1].str(), ctx) + "[" + resolve_ref(m[2].str(), ctx) + "]";
+  }
+  // Cython 3.x: __Pyx_PyNumber_Int(x) -> int(x)
+  static const std::regex re_numint(
+      R"(__Pyx_PyNumber_Int\s*\(\s*([^)]+?)\))");
+  if (std::regex_search(r, m, re_numint)) {
+    return "int(" + resolve_ref(m[1].str(), ctx) + ")";
+  }
+  // Cython 3.x: PyList_New(N) -> [] (empty list)
+  static const std::regex re_listnew(
+      R"(PyList_New\s*\(\s*\d+\s*\))");
+  if (std::regex_search(r, m, re_listnew)) return "[]";
+  // Cython 3.x: __Pyx_PyDict_NewPresized(N) or PyDict_New()
+  static const std::regex re_dictnew(
+      R"(__Pyx_PyDict_NewPresized\s*\(\s*\d+\s*\))");
+  if (std::regex_search(r, m, re_dictnew)) return "{}";
+  static const std::regex re_dictnew2(R"(PyDict_New\s*\(\s*\))");
+  if (std::regex_search(r, m, re_dictnew2)) return "{}";
+  // Cython 3.x: PyUnicode_FromStringAndSize / PyUnicode_FromString -> the string
+  // These are usually used with literal strings; skip.
+  // Cython 3.x: __Pyx_PyObject_GetAttrStr
+  // (already handled below in the original patterns)
+
   // 1) __Pyx_PyObject_Call(FN, ARGS, KWDS)
   static const std::regex re_call(R"(__Pyx_PyObject_Call\s*\(\s*([^,]+)\s*,\s*([^,]+)\s*,\s*([^)]+?)\))");
   if (std::regex_search(r, m, re_call)) {
@@ -1350,7 +1446,8 @@ static std::string decode_rhs(const std::string& rhs, DecodeCtx& ctx) {
     std::string args_tok = trim(m[2].str());
     std::string kwds_tok = trim(m[3].str());
     std::string args;
-    if (args_tok == "NULL" || args_tok == "0" || args_tok == "__pyx_empty_tuple") {
+    if (args_tok == "NULL" || args_tok == "0" || args_tok == "__pyx_empty_tuple" ||
+        args_tok == "__pyx_mstate_global->__pyx_empty_tuple") {
       args = "";
     } else {
       args = resolve_ref(args_tok, ctx);
@@ -1508,9 +1605,10 @@ static bool try_decode_stmt(const std::string& stmt, DecodeCtx& ctx,
   // and call decode_rhs, which doesn't know how to render a CyFunction_New call.
   // Note: re_cyfn doesn't consume the full statement (the call has more args
   // after __pyx_mdef_X), so we use regex_search.
+  // Cython 0.x uses __pyx_mdef_X, Cython 3.x may use __pyx_mdef_X or __pyx_Umdef_X.
   {
     static const std::regex re_cyfn(
-        R"(^(__pyx_t_\d+)\s*=\s*__Pyx_CyFunction_New\s*\(\s*&\s*(__pyx_mdef_[A-Za-z0-9_]+)\s*,)");
+        R"PYREGEX(^(__pyx_t_\d+)\s*=\s*__Pyx_CyFunction_New\s*\(\s*&\s*(__pyx_[Um]*mdef_[A-Za-z0-9_]+)\s*,)PYREGEX");
     std::smatch m_cy;
     if (std::regex_search(s, m_cy, re_cyfn)) {
       std::string tmp = m_cy[1].str();
@@ -1590,13 +1688,17 @@ static bool try_decode_stmt(const std::string& stmt, DecodeCtx& ctx,
   }
 
   // __Pyx_GetModuleGlobalName(TMP, NAME) -> TMP = NAME (global lookup)
+  // Cython 0.x: __Pyx_GetModuleGlobalName(__pyx_t_1, __pyx_n_s_NAME)
+  // Cython 3.x: __Pyx_GetModuleGlobalName(__pyx_t_1, __pyx_mstate_global->__pyx_n_u_NAME)
   static const std::regex re_getglobal(
-      R"(^__Pyx_GetModuleGlobalName\s*\(\s*(__pyx_t_\d+)\s*,\s*(__pyx_[^)]+?)\))");
+      R"PYREGEX(^__Pyx_GetModuleGlobalName\s*\(\s*(__pyx_t_\d+)\s*,\s*((?:__pyx_mstate(?:_global)?->__pyx_)?__pyx_[^)]+?)\))PYREGEX");
   if (std::regex_search(s, m, re_getglobal)) {
     std::string tmp = m[1].str();
     std::string name = resolve_ref(m[2].str(), ctx);
     if (name.size() >= 2 && name.front() == '"' && name.back() == '"')
       name = name.substr(1, name.size() - 2);
+    else if (name.size() >= 3 && name.substr(0, 2) == "b\"" && name.back() == '"')
+      name = name.substr(2, name.size() - 3);
     ctx.ssa[tmp] = name;
     res.matched = true;
     return true;
@@ -1624,13 +1726,17 @@ static bool try_decode_stmt(const std::string& stmt, DecodeCtx& ctx,
   }
 
   // PyDict_SetItem(__pyx_d, __pyx_n_s_NAME, VALUE);
+  // or PyDict_SetItem(__pyx_mstate_global->__pyx_d, __pyx_mstate_global->__pyx_n_s_NAME, VALUE);
+  // (Cython 3.x)
   static const std::regex re_modassign(
-      R"(^PyDict_SetItem\s*\(\s*__pyx_d\s*,\s*(__pyx_[^,]+)\s*,\s*([^)]+?)\)\s*$)");
+      R"PYREGEX(^PyDict_SetItem\s*\(\s*(?:__pyx_mstate(?:_global)?->__pyx_d|__pyx_d)\s*,\s*([^,]+?)\s*,\s*([^)]+?)\)\s*$)PYREGEX");
   if (std::regex_match(s, m, re_modassign)) {
     if (!ctx.is_function) {
       std::string name = resolve_ref(m[1].str(), ctx);
       if (name.size() >= 2 && name.front() == '"' && name.back() == '"')
         name = name.substr(1, name.size() - 2);
+      else if (name.size() >= 3 && name.substr(0, 2) == "b\"" && name.back() == '"')
+        name = name.substr(2, name.size() - 3);
       std::string val_tok = trim(m[2].str());
       std::string val = decode_rhs(val_tok, ctx);
       auto it = ctx.ssa.find(val_tok);
@@ -1816,12 +1922,12 @@ static std::string preprocess_body(const std::string& body) {
               // The `if (...)` outer parens contain `CALL(...) < 0`. We need
               // to extract just `CALL(...)` from inside the parens.
               std::string inside = out.substr(lp + 1, rp - lp - 1);
-              // Strip trailing ` < 0` from inside
+              // Strip trailing ` < 0` or ` < (0)` from inside
               size_t lt_pos = inside.rfind('<');
               if (lt_pos != std::string::npos) {
-                // Check that what follows is just `0`
+                // Check that what follows is `0` or `(0)`
                 std::string after = trim(inside.substr(lt_pos + 1));
-                if (after == "0") {
+                if (after == "0" || after == "(0)") {
                   std::string call = trim(inside.substr(0, lt_pos));
                   // Now check that after the outer `)` there's `__PYX_ERR(`
                   size_t after_rp = rp + 1;
@@ -2069,7 +2175,43 @@ static std::string emit_python(const SymbolTable& st,
     out << "\n";
   }
 
-  for (const auto& s : module_stmts) out << s << "\n";
+  // Post-process module statements: convert any statement containing unresolved
+  // C API calls (like __Pyx_PyObject_FastCall, __pyx_mstate_global->, etc.) to a comment.
+  // This makes the output syntactically valid Python even when we can't fully decompile.
+  auto sanitize_stmt = [](const std::string& s) -> std::string {
+    // Check for unresolved C API patterns
+    bool has_unresolved = false;
+    for (const auto& pat : {
+        "__Pyx_", "__pyx_mstate", "__pyx_t_", "__pyx_tuple[",
+        "__pyx_slice[", "__pyx_int[", "__pyx_codeobj",
+        "PyObject_", "PyDict_", "PyList_", "PyUnicode_",
+        "PyTuple_", "PySlice_", "PyLong_", "PyInt_",
+        "Py_None", "Py_True", "Py_False",
+        "->", "(PyObject*", "unlikely(", "likely(",
+        "__PYX_ERR", "__pyx_L", "goto ", "return 0",
+        "return -1", "return __pyx",
+    }) {
+      if (s.find(pat) != std::string::npos) { has_unresolved = true; break; }
+    }
+    if (has_unresolved) {
+      // Convert to a comment, escaping any special chars
+      std::string escaped = s;
+      // Replace newlines with "\n# "
+      for (size_t i = 0; i < escaped.size(); ++i) {
+        if (escaped[i] == '\n') { escaped.replace(i, 1, "\n# "); i += 2; }
+      }
+      return "# [unresolved] " + escaped;
+    }
+    return s;
+  };
+
+  std::vector<std::string> sanitized_stmts;
+  sanitized_stmts.reserve(module_stmts.size());
+  for (const auto& s : module_stmts) {
+    sanitized_stmts.push_back(sanitize_stmt(s));
+  }
+
+  for (const auto& s : sanitized_stmts) out << s << "\n";
 
   if (emit_debug && !debug_log.empty()) {
     out << "\n# --- debug log ---\n";
@@ -2284,6 +2426,7 @@ int main(int argc, char** argv) {
       size_t p = s.find(" = __CYFUNCTION__:");
       if (p != std::string::npos) {
         std::string name = s.substr(0, p);
+        bool found = false;
         for (auto& f : funcs) {
           if (f.py_name == name) {
             std::ostringstream defn;
@@ -2299,8 +2442,13 @@ int main(int argc, char** argv) {
             s = defn.str();
             if (f.py_body.empty()) s += "\n    pass  # body not recovered";
             else for (auto& bl : f.py_body) s += "\n    " + bl;
+            found = true;
             break;
           }
+        }
+        if (!found) {
+          // Function not found in funcs list — emit a stub
+          s = "def " + name + "():\n    pass  # body not recovered";
         }
       }
     }
